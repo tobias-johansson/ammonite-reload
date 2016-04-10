@@ -5,57 +5,67 @@ implicit class Reload(load: ammonite.repl.frontend.Load) {
   import java.nio.file._
   import java.nio.file.StandardWatchEventKinds._
   import scala.collection.JavaConversions._
+  import scala.util.Try
 
   def reload(path: ammonite.ops.Path) = {
 
     load.module(path)
 
     val file = path.toNIO.toAbsolutePath
-    val dir  = file.getParent
 
-    val ws = FileSystems.getDefault().newWatchService()
-    dir.register(ws, ENTRY_MODIFY)
-
-    val watcher = new Watcher(ws) {
-      def observe(kind: WatchEvent.Kind[Path], path: Path) = {
-        val changed = dir.resolve(path)
-        if (changed == file) {
-          val toLoad = ammonite.ops.Path(changed.toFile)
-          println(s"Reloading module $toLoad")
-          load.module(toLoad)
-        }
-      }
+    val watcher = Watcher(file) { path =>
+      val toLoad = ammonite.ops.Path(path)
+      println("")
+      println(s"<Reloading module $toLoad>")
+      Try(load.module(toLoad))
+      print(colors().prompt() + prompt() + colors().reset())
     }
 
     watcher.start()
     watcher
   }
 
-  abstract class Watcher(ws: WatchService) extends Thread {
+  object Watcher {
+    def apply(path: Path)(obs: Path => Unit) =
+      new Watcher(path) {
+        def observe(kind: WatchEvent.Kind[Path], path: Path) = obs(path)
+      }
+  }
+
+  abstract class Watcher(file: Path) extends Thread {
     private[this] var running = true
+    val ws = FileSystems.getDefault().newWatchService()
 
-    def observe(kind: WatchEvent.Kind[Path], path: Path): Unit
+    def observe(kind: WatchEvent.Kind[Path], file: Path): Unit
 
-    override def run() =
+    override def run() = {
+      val dir = file.getParent
+      dir.register(ws, ENTRY_MODIFY)
+      def isOurFile(p: Path) = dir.resolve(p) == file
       while (running) {
-        try {
+        val attempt = Try {
           val key = ws.take()
           key.pollEvents().foreach {
             case event if event.kind == OVERFLOW =>
               running = false
-            case event: WatchEvent[Path] =>
-              observe(event.kind, event.context)
-              running = key.reset
+            case event: WatchEvent[Path]
+            if isOurFile(event.context) =>
+              observe(event.kind, dir.resolve(event.context))
             case _ =>
           }
-        } catch {
-          case _ => running = false
+          key.reset
         }
+        running = attempt.isSuccess
       }
+      println(s"<Stopping $this>")
+    }
 
     def cancel(): Unit = {
       running = false
       ws.close()
     }
+
+    override def toString(): String =
+      s"Watcher($file)"
   }
 }
